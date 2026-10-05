@@ -81,7 +81,7 @@ Run all four checks before every commit. CI runs the same ones.
   Never predict trial outcomes.
 - **Sentiment is deferred** until there is a specific, testable hypothesis.
 - **Statistics:** cluster standard errors by date, use t > 3, pre-register each
-  hypothesis in the design doc, and treat the pre-2023 and 2023+ samples as different
+  hypothesis in `docs/preregistration/` (a registered file never changes), and treat the pre-2023 and 2023+ samples as different
   regimes for AI compute.
 
 ## Status
