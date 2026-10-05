@@ -9,9 +9,10 @@ import httpx
 import pytest
 
 from sds.ingest.http import PoliteClient, RateLimiter
-from sds.ingest.prices import TiingoSource, load_prices
+from sds.ingest.prices import Bar, TiingoSource, load_prices, upsert_bars
 from sds.ingest.raw_store import RawStore
 from sds.runs import QualityGateError
+from sds.timeutil import market_close_utc
 
 TODAY = date(2024, 6, 12)
 
@@ -68,6 +69,77 @@ def test_token_never_stored(
     assert "SECRET" in str(seen[0].url)
     uris = conn.execute("SELECT uri FROM raw_documents").fetchall()
     assert all("SECRET" not in u for (u,) in uris)
+
+
+def test_upsert_refreshes_adjusted_close(conn: duckdb.DuckDBPyConnection) -> None:
+    # A refetch after a split changes adj_close only.
+    sid = add_ticker(conn, "NVDA", "0001045810")
+    day = date(2024, 6, 7)
+    assert upsert_bars(conn, sid, "tiingo", [Bar(day, None, None, None, 10.0, 10.0, None)]) == 1
+    assert upsert_bars(conn, sid, "tiingo", [Bar(day, None, None, None, 10.0, 1.0, None)]) == 1
+
+    rows = conn.execute(
+        "SELECT open, high, low, close, adj_close, volume, known_at FROM prices_daily"
+    ).fetchall()
+    assert rows == [(None, None, None, 10.0, 1.0, None, market_close_utc(day))]
+
+
+def test_upsert_types_columns_beyond_the_first_rows(conn: duckdb.DuckDBPyConnection) -> None:
+    # Old history often lacks OHLC. Type inference from the first rows alone would see
+    # an all-NULL column and then fail, or truncate, on the first real value.
+    sid = add_ticker(conn, "NVDA", "0001045810")
+    first = date(2010, 1, 1).toordinal()
+    bars = [
+        Bar(date.fromordinal(first + i), None, None, None, 10.0, 10.0, None) for i in range(200)
+    ]
+    bars.append(Bar(date.fromordinal(first + 200), 12.5, 13.0, 12.0, 12.75, 12.75, 1000.0))
+
+    assert upsert_bars(conn, sid, "tiingo", bars) == 201
+    last = conn.execute(
+        "SELECT open, volume FROM prices_daily ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    assert last == (12.5, 1000.0)
+
+
+def test_only_missing_skips_securities_with_bars(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path, fixtures: Path
+) -> None:
+    add_ticker(conn, "NVDA", "0001045810")
+    add_ticker(conn, "AMD", "0000002488")
+    store = RawStore(tmp_path, conn)
+    payload = (fixtures / "tiingo_prices.json").read_bytes()
+    load_prices(conn, store, tiingo(payload), start=date(2024, 6, 1), on=TODAY)
+    add_ticker(conn, "MU", "0000723125")
+
+    seen: list[httpx.Request] = []
+    stats = load_prices(
+        conn, store, tiingo(payload, seen), start=date(2024, 6, 1), on=TODAY, only_missing=True
+    )
+
+    assert [r.url.path for r in seen] == ["/tiingo/daily/mu/prices"]
+    assert stats.rows_written == 3
+
+
+def test_token_never_stored_on_http_error(conn: duckdb.DuckDBPyConnection, tmp_path: Path) -> None:
+    # Tiingo answers 404 for a ticker it does not know; httpx puts the full URL,
+    # query string included, in the error text that the run log and quarantine keep.
+    add_ticker(conn, "ZZZZ", "0000000001")
+    client = PoliteClient(
+        "t t@example.com",
+        1000,
+        transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+        sleep=lambda _: None,
+    )
+    source = TiingoSource(client, token="SECRET")
+    with pytest.raises(RuntimeError) as exc_info:
+        load_prices(conn, RawStore(tmp_path, conn), source, start=date(2024, 6, 1), on=TODAY)
+
+    assert "404" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+    reasons = conn.execute("SELECT reason FROM quarantine").fetchall()
+    errors = conn.execute("SELECT error FROM runs").fetchall()
+    assert reasons and errors
+    assert all("SECRET" not in str(text) for (text,) in reasons + errors)
 
 
 def test_bad_rows_quarantined_and_gate_blocks_writes(

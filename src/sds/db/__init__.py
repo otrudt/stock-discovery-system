@@ -6,6 +6,7 @@ from importlib import resources
 from pathlib import Path
 
 import duckdb
+import polars as pl
 
 _MIGRATIONS_PACKAGE = "sds.db.migrations"
 
@@ -51,3 +52,23 @@ def migrate(conn: duckdb.DuckDBPyConnection) -> list[int]:
             raise
         newly_applied.append(version)
     return newly_applied
+
+
+def insert_frame(
+    conn: duckdb.DuckDBPyConnection, table: str, frame: pl.DataFrame, on_conflict: str = ""
+) -> int:
+    """Insert a whole frame in one statement; returns the row count.
+
+    Row-at-a-time `executemany` runs at about 1k rows/s in DuckDB; a scan of the frame
+    is orders of magnitude faster. Columns are matched by name. `on_conflict` is a
+    trusted SQL suffix such as "ON CONFLICT (...) DO UPDATE SET ...".
+    """
+    if frame.is_empty():
+        return 0
+    cols = ", ".join(frame.columns)
+    conn.register("_insert_frame", frame)
+    try:
+        conn.execute(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM _insert_frame {on_conflict}")
+    finally:
+        conn.unregister("_insert_frame")
+    return frame.height

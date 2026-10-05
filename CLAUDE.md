@@ -40,8 +40,10 @@ say so. Look-ahead bugs make results look great and mean nothing.
 uv sync --all-groups
 uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
 
-uv run sds init | universe check | universe seed | prices load | health
+uv run sds init | universe check | universe seed | prices load [--only-missing] | health
 ```
+
+The code reads `os.environ` only. Source `.env` first: `set -a; . ./.env; set +a`.
 
 Run all four checks before every commit. CI runs the same ones.
 
@@ -85,10 +87,16 @@ Run all four checks before every commit. CI runs the same ones.
 ## Status
 
 - **Phase 0 done:** schema, as-of reads, sector config, raw store, run log, Tiingo
-  price loader, 20 tests.
-- **Not yet verified against live sources.** The first real `universe seed` and
-  `prices load` on a local machine is the check. Expect unresolved tickers (e.g.
-  share classes, recent IPOs) and fix the config, not the code, where possible.
+  price loader, 25 tests.
+- **Verified against live sources on 2026-10-05.** All 59 seeds resolved in the SEC
+  map with no config changes. Tiingo loaded 159,117 bars for all 59 (2015-01-02 to
+  2026-10-02). The token was absent from the database and the raw store.
+- **Found in the live check and fixed:** HTTP error text leaked the Tiingo token into
+  the quarantine table (now redacted); `health` crashed on loaded data (missing
+  `pytz`); the upsert ran at ~900 rows/s (now one bulk insert, ~100k rows/s).
+- **Tiingo free tier allows ~50 requests per hour.** A full load of more than 50
+  tickers fails the rest with 429. Fill the gap an hour later with
+  `prices load --only-missing`.
 - **Next, Phase 1:**
   1. Form 4 ingestion. Backfill from the SEC Insider Transactions Data Sets
      (quarterly flat files); use per-filing XML for recent filings.

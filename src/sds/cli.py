@@ -65,7 +65,10 @@ def universe_seed(config: Path = DEFAULT_CONFIG) -> None:
 
 
 @prices_app.command("load")
-def prices_load(start: str = "2015-01-01") -> None:
+def prices_load(
+    start: str = "2015-01-01",
+    only_missing: bool = typer.Option(False, help="Fetch only securities with no bars yet."),
+) -> None:
     """Fetch daily prices for every current ticker from Tiingo."""
     settings = Settings.from_env()
     token = os.environ.get("SDS_TIINGO_TOKEN", "")
@@ -79,6 +82,7 @@ def prices_load(start: str = "2015-01-01") -> None:
             RawStore(settings.raw_dir, conn),
             TiingoSource(client, token),
             start=date.fromisoformat(start),
+            only_missing=only_missing,
         )
     finally:
         client.close()

@@ -35,6 +35,23 @@ class RateLimiter:
             self._next = now + self.interval
 
 
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Like httpx's raise_for_status, but the message drops the query string.
+
+    Query strings can carry API tokens, and error text ends up in the run log and the
+    quarantine table. `from None` keeps the original message out of tracebacks too.
+    """
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        url = resp.request.url.copy_with(query=None)
+        raise httpx.HTTPStatusError(
+            f"HTTP {resp.status_code} {resp.reason_phrase} for url '{url}'",
+            request=resp.request,
+            response=resp,
+        ) from None
+
+
 class PoliteClient:
     def __init__(
         self,
@@ -60,10 +77,10 @@ class PoliteClient:
             self.limiter.wait()
             resp = self._client.get(url, params=params)
             if resp.status_code not in RETRY_STATUS:
-                resp.raise_for_status()
+                _raise_for_status(resp)
                 return resp.content
             if attempt == self.max_retries:
-                resp.raise_for_status()
+                _raise_for_status(resp)
             retry_after = resp.headers.get("Retry-After", "")
             delay = float(retry_after) if retry_after.isdigit() else 2.0**attempt
             self._sleep(min(delay, 60.0))

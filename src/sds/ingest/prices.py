@@ -16,7 +16,9 @@ from datetime import date, datetime
 from typing import Protocol
 
 import duckdb
+import polars as pl
 
+from sds.db import insert_frame
 from sds.ingest.http import PoliteClient
 from sds.ingest.raw_store import RawStore
 from sds.runs import RunStats, enforce_quality_gate, quarantine, run_job
@@ -112,6 +114,22 @@ def validate_bar(row: dict[str, object], today: date) -> Bar:
     return Bar(d, _num(row.get("open")), high, low, close, adj, volume)
 
 
+_BAR_SCHEMA = pl.Schema(
+    {
+        "security_id": pl.Int64(),
+        "date": pl.Date(),
+        "open": pl.Float64(),
+        "high": pl.Float64(),
+        "low": pl.Float64(),
+        "close": pl.Float64(),
+        "adj_close": pl.Float64(),
+        "volume": pl.Float64(),
+        "source": pl.String(),
+        "known_at": pl.Datetime("us", "UTC"),
+    }
+)
+
+
 def upsert_bars(
     conn: duckdb.DuckDBPyConnection, security_id: int, source: str, bars: Iterable[Bar]
 ) -> int:
@@ -132,22 +150,20 @@ def upsert_bars(
         )
         for b in bars
     ]
-    if not rows:
-        return 0
-    conn.executemany(
-        """
-        INSERT INTO prices_daily
-          (security_id, date, open, high, low, close, adj_close, volume, source, known_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    # An explicit schema keeps an all-NULL column typed instead of failing the insert.
+    frame = pl.DataFrame(rows, schema=_BAR_SCHEMA, orient="row")
+    return insert_frame(
+        conn,
+        "prices_daily",
+        frame,
+        on_conflict="""
         ON CONFLICT (security_id, date, source) DO UPDATE SET
           open = excluded.open, high = excluded.high, low = excluded.low,
           close = excluded.close, adj_close = excluded.adj_close,
           volume = excluded.volume, known_at = excluded.known_at,
           ingested_at = now()
         """,
-        rows,
     )
-    return len(rows)
 
 
 def fetch_and_parse(
@@ -201,6 +217,19 @@ def parse_raw(
     return good
 
 
+def _targets(
+    conn: duckdb.DuckDBPyConnection, source: str, only_missing: bool
+) -> list[tuple[int, str]]:
+    sql = "SELECT security_id, ticker FROM ticker_history t WHERE valid_to IS NULL"
+    if only_missing:
+        sql += (
+            " AND NOT EXISTS (SELECT 1 FROM prices_daily p"
+            " WHERE p.security_id = t.security_id AND p.source = ?)"
+        )
+    rows = conn.execute(sql + " ORDER BY ticker", [source] if only_missing else []).fetchall()
+    return [(int(sid), str(ticker)) for sid, ticker in rows]
+
+
 def load_prices(
     conn: duckdb.DuckDBPyConnection,
     store: RawStore,
@@ -208,17 +237,19 @@ def load_prices(
     *,
     start: date,
     on: date | None = None,
+    only_missing: bool = False,
 ) -> RunStats:
     """Fetch prices for every security with a current ticker.
+
+    `only_missing` limits the run to securities with no bars from this source yet,
+    to fill gaps left by a rate-limited run without spending the quota again.
 
     All bars are staged in memory and written in one transaction only after the
     quality gate passes, so a bad run leaves the price table exactly as it was.
     Quarantined rows are kept either way, for debugging.
     """
     today = on or utc_now().date()
-    targets = conn.execute(
-        "SELECT security_id, ticker FROM ticker_history WHERE valid_to IS NULL ORDER BY ticker"
-    ).fetchall()
+    targets = _targets(conn, source.name, only_missing)
     with run_job(conn, f"prices.{source.name}") as stats:
         staged: list[tuple[int, list[Bar]]] = []
         failures: list[str] = []
