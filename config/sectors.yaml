@@ -1,0 +1,72 @@
+# What the system studies. Adding a sector is an edit here, not a code change.
+#
+# Two ways a name enters the universe:
+#   seeds     — hand-picked tickers (basis: curated). Written today, so they carry
+#               hindsight: strict point-in-time reads exclude them before their
+#               recorded date. Useful for exploration and the live watchlist.
+#   sic_codes — SEC industry codes for rule-based membership (basis: rule), built in
+#               Phase 1 from point-in-time filings. Rules are what backtests use.
+#
+# Seeds are illustrative starting points, not recommendations.
+# Quote tickers YAML reads as booleans or numbers ("ON", "YES", "NO").
+
+version: 1
+
+families:
+  ai_compute:
+    label: AI compute
+    sic_codes: [3674, 3576, 3577, 3661, 3663, 3669, 3679, 3585, 3613, 6798, 4911]
+    layers:
+      accelerators: { label: Accelerators and chip design, seeds: [NVDA, AMD, AVGO, MRVL] }
+      foundry_packaging: { label: Foundry and packaging, seeds: [TSM, AMKR] }
+      memory: { label: Memory, seeds: [MU] }
+      equipment: { label: Semiconductor equipment, seeds: [ASML, AMAT, LRCX, KLAC] }
+      networking: { label: Networking and optics, seeds: [ANET, CIEN, COHR, LITE, CRDO] }
+      systems: { label: Servers and systems, seeds: [SMCI, DELL, HPE] }
+      power_cooling: { label: Power and cooling, seeds: [VRT, ETN, GEV, NVT, MOD] }
+      data_centers: { label: Data centers and neoclouds, seeds: [EQIX, DLR, CRWV] }
+      power_generation: { label: Power generation, seeds: [CEG, VST] }
+
+  components:
+    label: Electronic components
+    sic_codes: [3670, 3672, 3674, 3675, 3676, 3677, 3678, 3679, 3825]
+    layers:
+      connectors: { label: Connectors and interconnect, seeds: [APH, TEL] }
+      analog_power: { label: Analog and power chips, seeds: [ADI, TXN, MPWR, "ON"] }
+      passives_protection: { label: Passives and circuit protection, seeds: [VSH, LFUS] }
+
+  robotics:
+    label: Robotics and automation
+    sic_codes: [3559, 3569, 3621, 3625, 3823, 3827, 3841]
+    layers:
+      industrial: { label: Industrial robots and test, seeds: [TER] }
+      motion_actuators: { label: Motion control and actuators, seeds: [ROK, RRX, PH] }
+      machine_vision: { label: Machine vision and sensing, seeds: [CGNX, ZBRA] }
+      warehouse: { label: Warehouse automation, seeds: [SYM] }
+      surgical: { label: Surgical robots, seeds: [ISRG, PRCT] }
+
+  pharma:
+    label: Pharmaceuticals
+    sic_codes: [2834]
+    layers:
+      large_cap: { label: Commercial-stage drug makers, seeds: [LLY, MRK, ABBV, PFE, BMY, AMGN, REGN, VRTX, NVO] }
+
+  bioscience:
+    label: Bioscience
+    sic_codes: [2833, 2835, 2836, 3826, 8731]
+    layers:
+      tools: { label: Life-science tools, seeds: [TMO, DHR, A, ILMN] }
+      # Clinical-stage biotech is filled by rules (SIC 2834/2836, small revenue),
+      # not by hand: hand-picking biotechs today is survivorship bias at its worst.
+      clinical: { label: Clinical-stage biotech, seeds: [] }
+
+# Foreign private issuers file 20-F/6-K and no Form 4, so the insider signal is
+# unavailable for them. Listed here until Phase 1 derives it from filing types.
+foreign_private_issuers: [TSM, ASML, NVO]
+
+# Small caps are a tier across families, computed point-in-time.
+small_cap:
+  market_cap_min_usd: 300_000_000
+  market_cap_max_usd: 2_000_000_000
+  min_median_dollar_volume_usd: 1_000_000
+  liquidity_lookback_days: 63
