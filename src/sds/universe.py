@@ -9,16 +9,14 @@ from typing import Any
 
 import duckdb
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
+
+from sds.configmodel import StrictModel
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "sectors.yaml"
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class Layer(_Strict):
+class Layer(StrictModel):
     label: str
     seeds: list[str] = Field(default_factory=list)
 
@@ -35,13 +33,13 @@ class Layer(_Strict):
         return v
 
 
-class Family(_Strict):
+class Family(StrictModel):
     label: str
     sic_codes: list[int] = Field(default_factory=list)
     layers: dict[str, Layer]
 
 
-class SmallCapTier(_Strict):
+class SmallCapTier(StrictModel):
     market_cap_min_usd: float = Field(gt=0)
     market_cap_max_usd: float = Field(gt=0)
     min_median_dollar_volume_usd: float = Field(ge=0)
@@ -54,7 +52,7 @@ class SmallCapTier(_Strict):
         return self
 
 
-class SectorConfig(_Strict):
+class SectorConfig(StrictModel):
     version: int
     families: dict[str, Family]
     foreign_private_issuers: list[str] = Field(default_factory=list)

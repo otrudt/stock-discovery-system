@@ -1,0 +1,10 @@
+# What to load from each source. sectors.yaml says what to study; this file says
+# what to fetch. Widening a load is an edit here, then a re-parse of the raw store.
+
+form345:
+  # SEC Insider Transactions Data Sets. 2012q1 gives three years of history before
+  # the first 2015 event, for the routine/opportunistic classification.
+  start_quarter: 2012q1
+  forms: ["4", "4/A"]
+  # S is loaded for the routine/opportunistic classification; the signal uses P only.
+  txn_codes: [P, S]
