@@ -11,6 +11,7 @@ from form345_fixture import build_zip, line, owner, submission
 
 from sds.ingest.config import Form345Config
 from sds.ingest.form345 import (
+    NONDERIV_TRANS,
     InsiderFrames,
     SchemaDriftError,
     discover,
@@ -174,6 +175,17 @@ def test_date_bounds_are_inclusive() -> None:
     )
     assert frames.rejected == []
     assert frames.filings["filing_date"].to_list() == [date(2026, 12, 31)]
+
+
+@pytest.mark.parametrize("value", ["NaN", "nan", "inf", "-inf", "1e400"])
+@pytest.mark.parametrize("column", ["shares", "price", "shares_owned_after"])
+def test_non_finite_numbers_are_rejected(column: str, value: str) -> None:
+    # DuckDB evaluates NaN > 0 as TRUE, so a later "shares > 0" filter would not stop it.
+    sec_name = {ours: sec for sec, ours in NONDERIV_TRANS.columns.items()}[column]
+    row = {**line("a1", "1"), sec_name: value}
+    frames = parse(build_zip([submission("a1")], [owner("a1", "11")], [row]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [("txns", f"bad {column}")]
+    assert frames.txns.is_empty()
 
 
 def test_duplicate_keys_are_rejected_not_dropped() -> None:

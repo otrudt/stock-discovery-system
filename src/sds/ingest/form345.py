@@ -160,6 +160,13 @@ def _date(col: str, max_date: date) -> pl.Expr:
     return pl.when(parsed.is_between(MIN_DATE, max_date)).then(parsed)
 
 
+def _number(col: str) -> pl.Expr:
+    """The value as a float, or null when not a finite number. "NaN", "inf" and "1e400"
+    all cast; DuckDB evaluates NaN > 0 as TRUE, so a later filter would not stop them."""
+    value = pl.col(col).cast(pl.Float64, strict=False)
+    return pl.when(value.is_finite()).then(value)
+
+
 def _cast_failed(raw: str, typed: pl.Expr) -> pl.Expr:
     """True where the text was present but did not convert."""
     return pl.col(raw).is_not_null() & typed.is_null()
@@ -234,7 +241,7 @@ def _txns(lines: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rejec
     numbers = ("shares", "price", "shares_owned_after")
     typed = lines.with_columns(
         _date("txn_date", max_date).alias("_txn_date"),
-        *(pl.col(c).cast(pl.Float64, strict=False).alias(f"_{c}") for c in numbers),
+        *(_number(c).alias(f"_{c}") for c in numbers),
     )
     good, rejected = _split_rejects(
         typed,
