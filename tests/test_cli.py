@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from sds.cli import app
 from sds.db import connect
+from sds.ingest.form345 import LoadReport
 
 
 def test_health_reports_loaded_prices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,3 +43,24 @@ def test_health_reports_insider_filings(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.exit_code == 0, result.output
     assert "insider_filings" in result.output
     assert "2024-01-03" in result.output
+
+
+def test_insiders_load_exits_nonzero_when_a_quarter_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SDS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SDS_USER_AGENT", "t t@example.com")
+    report = LoadReport(loaded=["2012q2"], failed={"2012q1": "HTTPStatusError: HTTP 404"})
+    monkeypatch.setattr("sds.cli.load_insiders", lambda *args, **kwargs: report)
+
+    result = CliRunner().invoke(app, ["insiders", "load"])
+
+    assert result.exit_code == 1
+    assert "failed 2012q1" in result.output
+
+
+def test_insiders_link_reports_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SDS_DATA_DIR", str(tmp_path))
+    result = CliRunner().invoke(app, ["insiders", "link"])
+    assert result.exit_code == 0, result.output
+    assert "amendments:" in result.output

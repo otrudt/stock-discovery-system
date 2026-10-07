@@ -9,9 +9,12 @@ from pathlib import Path
 import typer
 
 from sds.db import connect
+from sds.ingest.config import DEFAULT_INGEST_CONFIG, load_ingest_config
+from sds.ingest.form345 import load_insiders
 from sds.ingest.http import PoliteClient
 from sds.ingest.prices import TiingoSource, load_prices
 from sds.ingest.raw_store import RawStore
+from sds.insiders import link_amendments
 from sds.settings import Settings
 from sds.timeutil import utc_now
 from sds.universe import DEFAULT_CONFIG, load_config, parse_sec_ticker_map, seed_universe
@@ -19,8 +22,10 @@ from sds.universe import DEFAULT_CONFIG, load_config, parse_sec_ticker_map, seed
 app = typer.Typer(no_args_is_help=True, help="Stock discovery system.")
 universe_app = typer.Typer(no_args_is_help=True, help="Universe commands.")
 prices_app = typer.Typer(no_args_is_help=True, help="Price commands.")
+insiders_app = typer.Typer(no_args_is_help=True, help="Insider (Form 4) commands.")
 app.add_typer(universe_app, name="universe")
 app.add_typer(prices_app, name="prices")
+app.add_typer(insiders_app, name="insiders")
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_RATE_PER_SECOND = 8.0  # under SEC's 10/s fair-access ceiling
@@ -90,6 +95,51 @@ def prices_load(
         f"rows in {stats.rows_in}, written {stats.rows_written}, "
         f"quarantined {stats.rows_quarantined} (run {stats.run_id})"
     )
+
+
+def _amendment_line(counts: dict[str, int]) -> str:
+    return "amendments: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none")
+
+
+@insiders_app.command("load")
+def insiders_load(
+    since: str | None = typer.Option(None, help="First quarter, e.g. 2012q1 (default: config)."),
+    quarter: str | None = typer.Option(None, help="Load only this quarter, e.g. 2026q2."),
+    refetch: bool = typer.Option(False, help="Fetch zips again even if stored."),
+    config: Path = DEFAULT_INGEST_CONFIG,
+) -> None:
+    """Load SEC quarterly Form 4 flat files, then link amendments."""
+    settings = Settings.from_env()
+    cfg = load_ingest_config(config).form345
+    conn = connect(settings.db_path)
+    client = PoliteClient(settings.require_user_agent(), SEC_RATE_PER_SECOND)
+    try:
+        report = load_insiders(
+            conn,
+            RawStore(settings.raw_dir, conn),
+            client,
+            cfg,
+            since=since,
+            only=quarter,
+            refetch=refetch,
+        )
+    finally:
+        client.close()
+    typer.echo(
+        f"quarters loaded {len(report.loaded)}, skipped {len(report.skipped)}, "
+        f"failed {len(report.failed)}"
+    )
+    typer.echo(_amendment_line(report.amendments))
+    for failed_quarter, error in report.failed.items():
+        typer.echo(f"  failed {failed_quarter}: {error}", err=True)
+    if report.failed:
+        raise typer.Exit(1)
+
+
+@insiders_app.command("link")
+def insiders_link() -> None:
+    """Recompute amendment links over all loaded filings."""
+    typer.echo(_amendment_line(link_amendments(connect(Settings.from_env().db_path))))
 
 
 @app.command()

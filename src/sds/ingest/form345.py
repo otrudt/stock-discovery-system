@@ -9,16 +9,22 @@ EDGAR's filing cut-off makes this late by up to a day, never early.
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
 
 import duckdb
 import polars as pl
 
 from sds.db import insert_frame
-from sds.ingest.config import Form345Config
+from sds.ingest.config import Form345Config, quarter_key
+from sds.ingest.http import PoliteClient
+from sds.ingest.raw_store import RawStore
+from sds.insiders import link_amendments
 from sds.runs import RunStats, enforce_quality_gate, quarantine, run_job
+from sds.timeutil import utc_now
 
 DATE_FORMAT = "%d-%b-%Y"
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
@@ -335,3 +341,98 @@ def load_quarter(
         enforce_quality_gate(stats)
         stats.rows_written = write_frames(conn, frames, raw_hash)
     return stats
+
+
+DATA_SETS_URL = "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
+_ZIP_LINK = re.compile(r'href="([^"]*/(\d{4}q[1-4])_form345\.zip)"')
+
+
+def discover(page: bytes) -> dict[str, str]:
+    """{quarter: zip URL} from the data-set page. URLs are read, never built: the SEC
+    already serves quarters from two different paths. The first link per quarter wins."""
+    found: dict[str, str] = {}
+    for href, quarter in _ZIP_LINK.findall(page.decode("utf-8", errors="replace")):
+        found.setdefault(quarter, urljoin(DATA_SETS_URL, href))
+    if not found:
+        raise ValueError(f"no *_form345.zip links on {DATA_SETS_URL}; has the page changed?")
+    return found
+
+
+@dataclass
+class LoadReport:
+    loaded: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    amendments: dict[str, int] = field(default_factory=dict)
+
+
+def _loaded(conn: duckdb.DuckDBPyConnection, quarter: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM runs WHERE job = ? AND status = 'ok' LIMIT 1", [f"form345.{quarter}"]
+    ).fetchone()
+    return row is not None
+
+
+def _raw_source(
+    conn: duckdb.DuckDBPyConnection,
+    store: RawStore,
+    client: PoliteClient,
+    url: str,
+    *,
+    refetch: bool,
+) -> Callable[[], tuple[bytes, str]]:
+    """Stored bytes when we have them (a parser fix is a re-parse), else a fetch."""
+
+    def get() -> tuple[bytes, str]:
+        if not refetch:
+            row = conn.execute(
+                "SELECT raw_hash FROM raw_documents WHERE uri = ? ORDER BY fetched_at DESC LIMIT 1",
+                [url],
+            ).fetchone()
+            if row is not None:
+                return store.get(str(row[0])), str(row[0])
+        data = client.get(url)
+        doc = store.put(data, source=SOURCE, uri=url, fetched_at=utc_now())
+        return data, doc.raw_hash
+
+    return get
+
+
+def load_insiders(
+    conn: duckdb.DuckDBPyConnection,
+    store: RawStore,
+    client: PoliteClient,
+    cfg: Form345Config,
+    *,
+    since: str | None = None,
+    only: str | None = None,
+    refetch: bool = False,
+) -> LoadReport:
+    """Load every quarter from `since` (default: config), or only one, then link.
+
+    A quarter with an ok run is skipped unless `refetch`. One failed quarter does not
+    stop the rest; it is reported and its run is marked failed.
+    """
+    urls = discover(client.get(DATA_SETS_URL))
+    if only is not None:
+        if only not in urls:
+            raise ValueError(f"{only} is not on the SEC data-set page")
+        wanted = [only]
+    else:
+        first = quarter_key(since or cfg.start_quarter)
+        wanted = sorted((q for q in urls if quarter_key(q) >= first), key=quarter_key)
+
+    report = LoadReport()
+    for quarter in wanted:
+        if not refetch and _loaded(conn, quarter):
+            report.skipped.append(quarter)
+            continue
+        try:
+            load_quarter(
+                conn, quarter, cfg, _raw_source(conn, store, client, urls[quarter], refetch=refetch)
+            )
+            report.loaded.append(quarter)
+        except Exception as exc:  # one bad quarter should not stop the rest
+            report.failed[quarter] = f"{type(exc).__name__}: {exc}"
+    report.amendments = link_amendments(conn)
+    return report
