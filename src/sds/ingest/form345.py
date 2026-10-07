@@ -108,11 +108,27 @@ class InsiderFrames:
     rows_in: int
 
 
+def _ragged_rows(data: bytes) -> list[bool]:
+    """Per data row: does its field count differ from the header's?
+
+    polars fills a short row's missing columns with NULL and raises no error, and a
+    newline inside a text field splits one record into two short rows. The lines are
+    split as polars splits them: on "\n", one trailing newline ends the last row, and an
+    empty line is a row. A "\r" before "\n" holds no tab, so it does not change a count.
+    """
+    lines = data.split(b"\n")
+    if data.endswith(b"\n"):
+        lines.pop()
+    header, *rows = (line.count(b"\t") for line in lines)
+    return [n != header for n in rows]
+
+
 def read_table(archive: zipfile.ZipFile, table: Table) -> pl.DataFrame:
-    """Read one TSV as text, renamed to our columns. Strict UTF-8: a bad byte fails
-    the quarter instead of silently altering text."""
+    """Read one TSV as text, renamed to our columns, plus `_ragged` per row. Strict
+    UTF-8: a bad byte fails the quarter instead of silently altering text."""
+    data = archive.read(table.file)
     frame = pl.read_csv(
-        io.BytesIO(archive.read(table.file)),
+        io.BytesIO(data),
         separator="\t",
         quote_char=None,
         infer_schema=False,
@@ -121,10 +137,19 @@ def read_table(archive: zipfile.ZipFile, table: Table) -> pl.DataFrame:
     missing = [c for c in table.columns if c not in frame.columns and c not in table.optional]
     if missing:
         raise SchemaDriftError(f"{table.file}: missing column(s) {', '.join(missing)}")
+    ragged = _ragged_rows(data)
+    if len(ragged) != frame.height:
+        raise ValueError(
+            f"{table.file}: {len(ragged)} lines but {frame.height} rows; ragged rows cannot"
+            " be told apart"
+        )
     frame = frame.with_columns(
         pl.lit(None, pl.String).alias(c) for c in table.columns if c not in frame.columns
     )
-    return frame.select(pl.col(sec).alias(ours) for sec, ours in table.columns.items())
+    return frame.select(
+        *(pl.col(sec).alias(ours) for sec, ours in table.columns.items()),
+        pl.Series("_ragged", ragged, pl.Boolean),
+    )
 
 
 def _payload(frame: pl.DataFrame) -> pl.Expr:
@@ -136,6 +161,15 @@ def _payload(frame: pl.DataFrame) -> pl.Expr:
 def _reject_all(frame: pl.DataFrame, table: str, reason: str) -> list[Rejected]:
     rows = frame.select("accession_no", _payload(frame)).iter_rows()
     return [Rejected(table, acc, reason, payload) for acc, payload in rows]
+
+
+def _split_ragged(frame: pl.DataFrame, table: str) -> tuple[pl.DataFrame, list[Rejected]]:
+    """Reject ragged rows before any scope filter: their columns are shifted, so a
+    fragment's form or code is garbage and must not make it look out of scope."""
+    ragged = frame.filter(pl.col("_ragged"))
+    return frame.filter(~pl.col("_ragged")).drop("_ragged"), _reject_all(
+        ragged, table, "ragged row"
+    )
 
 
 def _split_rejects(
@@ -287,20 +321,33 @@ def parse_zip(
 
     A date outside [MIN_DATE, max_date] is rejected like an unparseable one.
 
-    Rows of out-of-scope forms or codes are skipped and not counted. Every other row
-    that fails a check is returned in `rejected` with its reason, never dropped.
+    Rows of out-of-scope forms or codes are skipped and not counted, except ragged rows:
+    their fields are shifted, so they are rejected and counted whatever their form or
+    code. Every other row that fails a check is returned in `rejected` with its reason,
+    never dropped.
     """
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        subs = read_table(archive, SUBMISSION)
-        owners = read_table(archive, REPORTINGOWNER)
-        lines = read_table(archive, NONDERIV_TRANS)
+        all_subs = read_table(archive, SUBMISSION)
+        all_owners = read_table(archive, REPORTINGOWNER)
+        all_lines = read_table(archive, NONDERIV_TRANS)
+
+    subs, rejected = _split_ragged(all_subs, "filings")
+    owners, bad = _split_ragged(all_owners, "owners")
+    rejected += bad
+    lines, bad = _split_ragged(all_lines, "txns")
+    rejected += bad
+    rows_in = len(rejected)
 
     in_scope = subs.filter(pl.col("form").is_in(forms))
-    filings, rejected = _filings(in_scope, max_date)
-    every_filing = subs.select("accession_no")
-    scoped = in_scope.select("accession_no")
+    filings, bad = _filings(in_scope, max_date)
+    rejected += bad
+    every_filing = all_subs.select("accession_no")
+    # A ragged filing's form is unknown, so its children are rejected, not skipped.
+    scoped = pl.concat(
+        [in_scope.select("accession_no"), all_subs.filter("_ragged").select("accession_no")]
+    )
     kept = filings.select("accession_no")
-    rows_in = in_scope.height
+    rows_in += in_scope.height
 
     # Owners and lines follow their filing: out-of-scope form -> skipped; filing
     # rejected -> rejected; no filing anywhere in the file -> rejected.

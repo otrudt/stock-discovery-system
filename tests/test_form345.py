@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -223,6 +226,98 @@ def test_amendment_naming_an_original_after_its_own_filing_is_rejected() -> None
         ("late", "bad date_of_orig_sub")
     ]
     assert frames.filings["accession_no"].to_list() == ["same"]
+
+
+def test_newline_in_remarks_rejects_both_fragments_as_ragged() -> None:
+    # The newline splits one record into two short rows. The first fragment loses
+    # AFF10B5ONE (the last column), so it would store a 10b5-1 trade as is_10b5_1 NULL.
+    split = {**submission("a1", aff="1"), "REMARKS": "line one\nline two"}
+    raw = build_zip([split, submission("b1")], [owner("a1", "11")], [line("a1", "1")])
+    frames = parse(raw)
+
+    assert sorted((r.table, r.accession_no, r.reason) for r in frames.rejected) == [
+        ("filings", "a1", "ragged row"),
+        ("filings", "line two", "ragged row"),  # the fragment: its accession is garbage
+        ("owners", "a1", "filing rejected"),
+        ("txns", "a1", "filing rejected"),
+    ]
+    assert frames.filings["accession_no"].to_list() == ["b1"]
+    assert frames.rows_in == 5
+
+
+def test_short_rows_are_ragged_in_every_table() -> None:
+    cut = frozenset({"AFF10B5ONE", "FILE_NUMBER", "NATURE_OF_OWNERSHIP_FN"})
+    full = build_zip([submission("a1", aff="1")], [owner("a1", "11")], [line("a1", "1")])
+    short = build_zip([submission("a1", aff="1")], [owner("a1", "11")], [line("a1", "1")], drop=cut)
+    # Splice each short data row under the full header.
+    raw = _swap_data_rows(full, short)
+    frames = parse(raw)
+    assert sorted((r.table, r.reason) for r in frames.rejected) == [
+        ("filings", "ragged row"),
+        ("owners", "ragged row"),
+        ("txns", "ragged row"),
+    ]
+    assert frames.rows_in == 3
+
+
+def test_a_ragged_line_is_rejected_even_if_its_code_is_out_of_scope() -> None:
+    # A shifted row's TRANS_CODE cannot be trusted, so it is not skipped silently.
+    raw = _swap_data_rows(
+        build_zip([submission("a1")], [owner("a1", "11")], [line("a1", "1", code="A")]),
+        build_zip(
+            [submission("a1")],
+            [owner("a1", "11")],
+            [line("a1", "1", code="A")],
+            drop=frozenset({"NATURE_OF_OWNERSHIP_FN"}),
+        ),
+        only="NONDERIV_TRANS.tsv",
+    )
+    frames = parse(raw)
+    assert [(r.table, r.reason) for r in frames.rejected] == [("txns", "ragged row")]
+    assert frames.filings["accession_no"].to_list() == ["a1"]
+
+
+def test_empty_line_is_a_ragged_row() -> None:
+    raw = _rewrite(
+        build_zip([submission("a1"), submission("b1")]),
+        lambda name, text: text.replace(b"\nb1", b"\n\nb1") if name == "SUBMISSION.tsv" else text,
+    )
+    frames = parse(raw)
+    assert [(r.table, r.reason) for r in frames.rejected] == [("filings", "ragged row")]
+    assert frames.filings["accession_no"].to_list() == ["a1", "b1"]
+
+
+@pytest.mark.parametrize("trailing", [b"\r\n", b""])
+def test_crlf_and_no_trailing_newline_are_not_ragged(trailing: bytes) -> None:
+    raw = _rewrite(
+        build_zip([submission("a1", aff="1")], [owner("a1", "11")], [line("a1", "1")]),
+        lambda _, text: text.rstrip(b"\n").replace(b"\n", b"\r\n") + trailing,
+    )
+    frames = parse(raw)
+    assert frames.rejected == []
+    assert frames.filings["is_10b5_1"].to_list() == [True]
+    assert frames.txns["direct_indirect"].to_list() == ["D"]
+
+
+def _rewrite(raw: bytes, edit: Callable[[str, bytes], bytes]) -> bytes:
+    """Apply `edit` to the bytes of each file in a fixture zip."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src, zipfile.ZipFile(out, "w") as dst:
+        for name in src.namelist():
+            dst.writestr(name, edit(name, src.read(name)))
+    return out.getvalue()
+
+
+def _swap_data_rows(full: bytes, short: bytes, only: str | None = None) -> bytes:
+    """`full`'s headers over `short`'s data rows: rows with fewer fields than the header."""
+    with zipfile.ZipFile(io.BytesIO(short)) as archive:
+        rows = {n: archive.read(n).split(b"\n", 1)[1] for n in archive.namelist()}
+    return _rewrite(
+        full,
+        lambda name, text: (
+            text if only not in (None, name) else text.split(b"\n", 1)[0] + b"\n" + rows[name]
+        ),
+    )
 
 
 def test_duplicate_keys_are_rejected_not_dropped() -> None:
