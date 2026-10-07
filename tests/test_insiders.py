@@ -187,3 +187,45 @@ def test_a_stale_link_is_cleared_when_a_rival_original_arrives(
     link_amendments(conn)
     assert matches(conn) == {"a": "many"}
     assert links(conn) == {}
+
+
+def insert_filing(
+    conn: duckdb.DuckDBPyConnection,
+    acc: str,
+    form: str,
+    filed: str,
+    known_at: str,
+    orig: str | None,
+) -> None:
+    """Direct SQL, so a row the parser would refuse can still reach the link pass."""
+    conn.execute(
+        "INSERT INTO insider_filings (accession_no, issuer_cik, form, filing_date,"
+        " period_of_report, date_of_orig_sub, known_at, raw_hash)"
+        " VALUES (?, '0000000001', ?, ?, ?, ?, ?, 'h')",
+        [acc, form, filed, filed, orig, known_at],
+    )
+    conn.execute(
+        "INSERT INTO insider_owners"
+        " VALUES (?, '0000000011', 'DOE', false, true, false, false, NULL)",
+        [acc],
+    )
+    conn.execute(
+        "INSERT INTO insider_txns VALUES (?, '1', 'P', ?, 100, 10, 'A', 1100, 'D')", [acc, filed]
+    )
+
+
+def test_an_original_known_after_its_amendment_is_never_linked(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # The 4/A claims an original from 20-MAR, but was itself filed on 05-MAR.
+    insert_filing(conn, "a", "4/A", "2024-03-05", "2024-03-06 03:00:00+00", orig="2024-03-20")
+    link_amendments(conn)
+    past = datetime(2024, 3, 10, tzinfo=UTC)
+    before = asof.insider_txns_as_of(conn, past)
+
+    insert_filing(conn, "o", "4", "2024-03-20", "2024-03-21 02:00:00+00", orig=None)
+    link_amendments(conn)
+
+    assert matches(conn) == {"a": "none"}
+    assert links(conn) == {}
+    assert_frame_equal(before, asof.insider_txns_as_of(conn, past))

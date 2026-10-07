@@ -210,6 +210,20 @@ def test_missing_ciks_keep_their_reasons() -> None:
     assert reasons == [("filings", "no issuer_cik"), ("owners", "no owner_cik")]
 
 
+def test_amendment_naming_an_original_after_its_own_filing_is_rejected() -> None:
+    raw = build_zip(
+        [
+            submission("late", form="4/A", filed="05-MAR-2024", orig="20-MAR-2024"),
+            submission("same", form="4/A", filed="05-MAR-2024", orig="05-MAR-2024"),
+        ]
+    )
+    frames = parse(raw)
+    assert [(r.accession_no, r.reason) for r in frames.rejected] == [
+        ("late", "bad date_of_orig_sub")
+    ]
+    assert frames.filings["accession_no"].to_list() == ["same"]
+
+
 def test_duplicate_keys_are_rejected_not_dropped() -> None:
     raw = build_zip(
         [submission("a1")],

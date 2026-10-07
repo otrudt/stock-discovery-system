@@ -197,7 +197,9 @@ def _filings(subs: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rej
             "duplicate key": pl.col("accession_no").is_duplicated(),
             "bad filing_date": pl.col("_filing_date").is_null(),
             "bad period_of_report": pl.col("_period").is_null(),
-            "bad date_of_orig_sub": _cast_failed("date_of_orig_sub", pl.col("_orig")),
+            # An original cannot postdate the filing that amends it.
+            "bad date_of_orig_sub": _cast_failed("date_of_orig_sub", pl.col("_orig"))
+            | (pl.col("_orig") > pl.col("_filing_date")),
             "bad is_10b5_1": _cast_failed("is_10b5_1", pl.col("_10b5")),
             "no issuer_cik": pl.col("issuer_cik").is_null(),
             "bad issuer_cik": _bad_cik("issuer_cik"),

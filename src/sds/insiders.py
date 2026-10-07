@@ -5,7 +5,8 @@ from __future__ import annotations
 import duckdb
 
 # A 4/A names its original only by filing date. Match on issuer, the exact set of
-# reporting owners and that date; the period of report breaks ties.
+# reporting owners and that date; the period of report breaks ties. An original known
+# after its amendment is never a candidate: the link would change a past view.
 _LINK_SQL = """
 CREATE OR REPLACE TEMP TABLE _owner_sets AS
 SELECT accession_no, string_agg(owner_cik, ',' ORDER BY owner_cik) AS owners
@@ -18,6 +19,7 @@ FROM insider_filings a
 JOIN _owner_sets ao ON ao.accession_no = a.accession_no
 JOIN insider_filings o
   ON o.form = '4' AND o.issuer_cik = a.issuer_cik AND o.filing_date = a.date_of_orig_sub
+  AND o.known_at <= a.known_at
 JOIN _owner_sets oo ON oo.accession_no = o.accession_no AND oo.owners = ao.owners
 WHERE a.form = '4/A';
 
