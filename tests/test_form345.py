@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -25,10 +25,11 @@ from sds.runs import QualityGateError
 
 FORMS = ["4", "4/A"]
 CODES = ["P", "S"]
+MAX_DATE = date(2026, 12, 31)  # fixed, so tests do not depend on the clock
 
 
 def parse(raw: bytes) -> InsiderFrames:
-    return parse_zip(raw, forms=FORMS, txn_codes=CODES)
+    return parse_zip(raw, forms=FORMS, txn_codes=CODES, max_date=MAX_DATE)
 
 
 def test_parse_types_and_pads_ciks() -> None:
@@ -138,6 +139,43 @@ def test_bad_rows_are_rejected_with_reasons() -> None:
     assert '"shares":"lots"' in bad_shares.payload  # quarantine keeps the bad value
 
 
+@pytest.mark.parametrize(
+    ("column", "kwargs"),
+    [
+        ("filing_date", {"filed": "02-JAN-24"}),  # 2-digit year parses to 0024
+        ("filing_date", {"filed": "02-JAN-2999"}),
+        ("period_of_report", {"period": "01-JAN-24"}),
+        ("date_of_orig_sub", {"form": "4/A", "orig": "01-JAN-24"}),
+    ],
+)
+def test_out_of_bound_filing_dates_are_rejected(column: str, kwargs: dict[str, str]) -> None:
+    frames = parse(build_zip([submission("a1", **kwargs)], [owner("a1", "11")]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [
+        ("filings", f"bad {column}"),
+        ("owners", "filing rejected"),
+    ]
+    assert frames.filings.is_empty()
+
+
+@pytest.mark.parametrize("day", ["01-JAN-24", "31-DEC-2002", "01-JAN-2999"])
+def test_out_of_bound_txn_date_is_rejected(day: str) -> None:
+    frames = parse(build_zip([submission("a1")], [owner("a1", "11")], [line("a1", "1", date=day)]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [("txns", "bad txn_date")]
+    assert frames.txns.is_empty()
+
+
+def test_date_bounds_are_inclusive() -> None:
+    frames = parse(
+        build_zip(
+            [submission("a1", filed="31-DEC-2026", period="01-JAN-2003")],
+            [owner("a1", "11")],
+            [line("a1", "1", date="01-JAN-2003")],
+        )
+    )
+    assert frames.rejected == []
+    assert frames.filings["filing_date"].to_list() == [date(2026, 12, 31)]
+
+
 def test_duplicate_keys_are_rejected_not_dropped() -> None:
     raw = build_zip(
         [submission("a1")],
@@ -194,6 +232,17 @@ def test_gate_blocks_every_write_for_the_quarter(
         ("filings: bad filing_date", "h1")
     ]
     assert conn.execute("SELECT status FROM runs").fetchall() == [("failed",)]
+
+
+def test_load_quarter_rejects_a_filing_dated_past_next_year(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    far = (datetime.now(UTC).date() + timedelta(days=800)).strftime("%d-%b-%Y")
+    raw = build_zip([submission(f"a{i}") for i in range(200)] + [submission("x", filed=far)])
+    load_quarter(conn, "2024q1", cfg, lambda: (raw, "h1"))
+    assert conn.execute("SELECT reason FROM quarantine").fetchall() == [
+        ("filings: bad filing_date",)
+    ]
 
 
 def test_schema_drift_fails_the_run_by_name(

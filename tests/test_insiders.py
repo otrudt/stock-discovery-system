@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import duckdb
 from form345_fixture import Row, build_zip, line, owner, submission
@@ -12,7 +12,8 @@ from sds.insiders import link_amendments
 
 
 def load(conn: duckdb.DuckDBPyConnection, raw: bytes) -> None:
-    write_frames(conn, parse_zip(raw, forms=["4", "4/A"], txn_codes=["P", "S"]), "h")
+    frames = parse_zip(raw, forms=["4", "4/A"], txn_codes=["P", "S"], max_date=date(2026, 12, 31))
+    write_frames(conn, frames, "h")
 
 
 def with_owner(subs: list[Row], cik: str = "11") -> bytes:

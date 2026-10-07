@@ -13,6 +13,7 @@ import re
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from urllib.parse import urljoin
 
 import duckdb
@@ -27,6 +28,10 @@ from sds.runs import RunStats, enforce_quality_gate, quarantine, run_job
 from sds.timeutil import utc_now
 
 DATE_FORMAT = "%d-%b-%Y"
+# Electronic Form 4 filing starts in 2003. An earlier date is a bad value, such as
+# "02-JAN-24", which parses as the year 0024 and would make known_at precede every as_of.
+MIN_DATE = date(2003, 1, 1)
+MAX_DATE_AHEAD = timedelta(days=366)  # load_quarter's upper bound: one year past today
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
 TRUE_VALUES = ["1", "true"]
 FALSE_VALUES = ["0", "false"]
@@ -149,8 +154,10 @@ def _split_rejects(
     return tagged.filter(pl.col("_reason") == "").drop("_reason"), rejected
 
 
-def _date(col: str) -> pl.Expr:
-    return pl.col(col).str.strptime(pl.Date, DATE_FORMAT, strict=False)
+def _date(col: str, max_date: date) -> pl.Expr:
+    """The parsed date, or null when unparseable or outside [MIN_DATE, max_date]."""
+    parsed = pl.col(col).str.strptime(pl.Date, DATE_FORMAT, strict=False)
+    return pl.when(parsed.is_between(MIN_DATE, max_date)).then(parsed)
 
 
 def _cast_failed(raw: str, typed: pl.Expr) -> pl.Expr:
@@ -158,12 +165,12 @@ def _cast_failed(raw: str, typed: pl.Expr) -> pl.Expr:
     return pl.col(raw).is_not_null() & typed.is_null()
 
 
-def _filings(subs: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
+def _filings(subs: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rejected]]:
     flag = pl.col("is_10b5_1").str.to_lowercase()
     typed = subs.with_columns(
-        _date("filing_date").alias("_filing_date"),
-        _date("period_of_report").alias("_period"),
-        _date("date_of_orig_sub").alias("_orig"),
+        _date("filing_date", max_date).alias("_filing_date"),
+        _date("period_of_report", max_date).alias("_period"),
+        _date("date_of_orig_sub", max_date).alias("_orig"),
         pl.when(flag.is_in(TRUE_VALUES))
         .then(True)
         .when(flag.is_in(FALSE_VALUES))
@@ -223,10 +230,10 @@ def _owners(owners: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
     ), rejected
 
 
-def _txns(lines: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
+def _txns(lines: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rejected]]:
     numbers = ("shares", "price", "shares_owned_after")
     typed = lines.with_columns(
-        _date("txn_date").alias("_txn_date"),
+        _date("txn_date", max_date).alias("_txn_date"),
         *(pl.col(c).cast(pl.Float64, strict=False).alias(f"_{c}") for c in numbers),
     )
     good, rejected = _split_rejects(
@@ -256,8 +263,12 @@ def _txns(lines: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
     ), rejected
 
 
-def parse_zip(raw: bytes, *, forms: list[str], txn_codes: list[str]) -> InsiderFrames:
-    """Parse one quarterly zip into typed frames. Pure: no database, no network.
+def parse_zip(
+    raw: bytes, *, forms: list[str], txn_codes: list[str], max_date: date
+) -> InsiderFrames:
+    """Parse one quarterly zip into typed frames. Pure: no database, no network, no clock.
+
+    A date outside [MIN_DATE, max_date] is rejected like an unparseable one.
 
     Rows of out-of-scope forms or codes are skipped and not counted. Every other row
     that fails a check is returned in `rejected` with its reason, never dropped.
@@ -268,7 +279,7 @@ def parse_zip(raw: bytes, *, forms: list[str], txn_codes: list[str]) -> InsiderF
         lines = read_table(archive, NONDERIV_TRANS)
 
     in_scope = subs.filter(pl.col("form").is_in(forms))
-    filings, rejected = _filings(in_scope)
+    filings, rejected = _filings(in_scope, max_date)
     every_filing = subs.select("accession_no")
     scoped = in_scope.select("accession_no")
     kept = filings.select("accession_no")
@@ -291,7 +302,7 @@ def parse_zip(raw: bytes, *, forms: list[str], txn_codes: list[str]) -> InsiderF
         children[table] = frame.join(kept, on="accession_no", how="semi")
 
     owner_rows, bad_owners = _owners(children["owners"])
-    txn_rows, bad_txns = _txns(children["txns"])
+    txn_rows, bad_txns = _txns(children["txns"], max_date)
     return InsiderFrames(filings, owner_rows, txn_rows, rejected + bad_owners + bad_txns, rows_in)
 
 
@@ -327,7 +338,12 @@ def load_quarter(
     """
     with run_job(conn, f"form345.{quarter}") as stats:
         data, raw_hash = raw()
-        frames = parse_zip(data, forms=cfg.forms, txn_codes=cfg.txn_codes)
+        frames = parse_zip(
+            data,
+            forms=cfg.forms,
+            txn_codes=cfg.txn_codes,
+            max_date=utc_now().date() + MAX_DATE_AHEAD,
+        )
         stats.rows_in = frames.rows_in
         for r in frames.rejected:
             quarantine(
