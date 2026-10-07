@@ -327,14 +327,34 @@ SOURCE = "sec/form345"
 _KEEP_EXISTING = "ON CONFLICT DO NOTHING"  # a filed fact does not change
 
 
+def _stored_accessions(conn: duckdb.DuckDBPyConnection, filings: pl.DataFrame) -> pl.DataFrame:
+    """The accessions of `filings` already in insider_filings."""
+    conn.register("_new_filings", filings.select("accession_no"))
+    try:
+        return conn.execute(
+            "SELECT accession_no FROM insider_filings"
+            " WHERE accession_no IN (SELECT accession_no FROM _new_filings)"
+        ).pl()
+    finally:
+        conn.unregister("_new_filings")
+
+
 def write_frames(conn: duckdb.DuckDBPyConnection, frames: InsiderFrames, raw_hash: str) -> int:
-    """Write one quarter in one transaction; returns rows inserted."""
+    """Write one quarter in one transaction; returns rows inserted.
+
+    A stored filing is complete: it gets no new owners or lines from a later load. DO
+    NOTHING on the filing alone would not stop new child keys, such as a renumbered
+    NONDERIV_TRANS_SK, and the filing's shares would count twice.
+    """
     conn.execute("BEGIN")
     try:
+        stored = _stored_accessions(conn, frames.filings)
+        owners = frames.owners.join(stored, on="accession_no", how="anti")
+        txns = frames.txns.join(stored, on="accession_no", how="anti")
         filings = frames.filings.with_columns(pl.lit(raw_hash).alias("raw_hash"))
         written = insert_frame(conn, "insider_filings", filings, _KEEP_EXISTING)
-        written += insert_frame(conn, "insider_owners", frames.owners, _KEEP_EXISTING)
-        written += insert_frame(conn, "insider_txns", frames.txns, _KEEP_EXISTING)
+        written += insert_frame(conn, "insider_owners", owners, _KEEP_EXISTING)
+        written += insert_frame(conn, "insider_txns", txns, _KEEP_EXISTING)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

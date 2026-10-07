@@ -9,6 +9,7 @@ import httpx
 import pytest
 from form345_fixture import build_zip, line, owner, submission
 
+from sds import asof
 from sds.ingest.config import Form345Config
 from sds.ingest.form345 import (
     NONDERIV_TRANS,
@@ -253,13 +254,47 @@ def test_load_quarter_writes_and_reload_writes_nothing(
     conn: duckdb.DuckDBPyConnection, cfg: Form345Config
 ) -> None:
     first = load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
-    second = load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
+    second = load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h2"))
 
     assert (first.rows_written, second.rows_written) == (3, 0)
     assert conn.execute("SELECT raw_hash FROM insider_filings").fetchall() == [("h1",)]
     assert conn.execute("SELECT job, status FROM runs").fetchall() == [
         ("form345.2024q1", "ok"),
         ("form345.2024q1", "ok"),
+    ]
+
+
+def test_a_stored_filing_gets_no_new_owners_or_lines_from_a_later_load(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    # The same accession with a renumbered line (SK 9) and another owner: DO NOTHING on
+    # the filing would not block the new child keys, and the shares would double.
+    again = build_zip([submission("a1")], [owner("a1", "12")], [line("a1", "9")])
+    load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
+    second = load_quarter(conn, "2024q2", cfg, lambda: (again, "h2"))
+
+    assert second.rows_written == 0
+    assert conn.execute("SELECT raw_hash FROM insider_filings").fetchall() == [("h1",)]
+    assert conn.execute("SELECT owner_cik FROM insider_owners").fetchall() == [("0000000011",)]
+    visible = asof.insider_txns_as_of(conn, datetime(2025, 1, 1, tzinfo=UTC))
+    assert visible["shares"].sum() == 100
+
+
+def test_a_later_load_still_writes_its_new_filings(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    both = build_zip(
+        [submission("a1"), submission("b1")],
+        [owner("a1", "12"), owner("b1", "11")],
+        [line("a1", "9"), line("b1", "1")],
+    )
+    load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
+    second = load_quarter(conn, "2024q2", cfg, lambda: (both, "h2"))
+
+    assert second.rows_written == 3  # b1's filing, owner and line; nothing for a1
+    assert conn.execute("SELECT accession_no, line_id FROM insider_txns ORDER BY 1").fetchall() == [
+        ("a1", "1"),
+        ("b1", "1"),
     ]
 
 
