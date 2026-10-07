@@ -174,9 +174,12 @@ def test_bad_rows_are_rejected_with_reasons() -> None:
     ("column", "kwargs"),
     [
         ("filing_date", {"filed": "02-JAN-24"}),  # 2-digit year parses to 0024
+        ("filing_date", {"filed": "31-DEC-2002"}),  # before electronic Form 4
         ("filing_date", {"filed": "02-JAN-2999"}),
         ("period_of_report", {"period": "01-JAN-24"}),
+        ("period_of_report", {"period": "31-DEC-1989"}),
         ("date_of_orig_sub", {"form": "4/A", "orig": "01-JAN-24"}),
+        ("date_of_orig_sub", {"form": "4/A", "orig": "31-DEC-1989"}),
     ],
 )
 def test_out_of_bound_filing_dates_are_rejected(column: str, kwargs: dict[str, str]) -> None:
@@ -188,7 +191,7 @@ def test_out_of_bound_filing_dates_are_rejected(column: str, kwargs: dict[str, s
     assert frames.filings.is_empty()
 
 
-@pytest.mark.parametrize("day", ["01-JAN-24", "31-DEC-2002", "01-JAN-2999"])
+@pytest.mark.parametrize("day", ["01-JAN-24", "31-DEC-1989", "01-JAN-2999"])
 def test_out_of_bound_txn_date_is_rejected(day: str) -> None:
     frames = parse(build_zip([submission("a1")], [owner("a1", "11")], [line("a1", "1", date=day)]))
     assert [(r.table, r.reason) for r in frames.rejected] == [("txns", "bad txn_date")]
@@ -198,13 +201,35 @@ def test_out_of_bound_txn_date_is_rejected(day: str) -> None:
 def test_date_bounds_are_inclusive() -> None:
     frames = parse(
         build_zip(
-            [submission("a1", filed="31-DEC-2026", period="01-JAN-2003")],
+            [
+                submission(
+                    "a1", form="4/A", filed="01-JAN-2003", period="01-JAN-1990", orig="01-JAN-1990"
+                ),
+                submission("a2", filed="31-DEC-2026"),
+            ],
             [owner("a1", "11")],
-            [line("a1", "1", date="01-JAN-2003")],
+            [line("a1", "1", date="01-JAN-1990")],
         )
     )
     assert frames.rejected == []
-    assert frames.filings["filing_date"].to_list() == [date(2026, 12, 31)]
+    assert frames.filings["filing_date"].to_list() == [date(2003, 1, 1), date(2026, 12, 31)]
+
+
+def test_pre_2003_fact_dates_in_a_later_filing_are_kept() -> None:
+    # A late filing can report a 2001 trade; only filing_date drives known_at.
+    frames = parse(
+        build_zip(
+            [
+                submission(
+                    "a1", form="4/A", filed="15-FEB-2012", period="16-MAR-2001", orig="27-JAN-2002"
+                )
+            ],
+            [owner("a1", "11")],
+            [line("a1", "1", date="16-MAR-2001")],
+        )
+    )
+    assert frames.rejected == []
+    assert frames.txns["txn_date"].to_list() == [date(2001, 3, 16)]
 
 
 @pytest.mark.parametrize("value", ["NaN", "nan", "inf", "-inf", "1e400"])

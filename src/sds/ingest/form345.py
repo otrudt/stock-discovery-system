@@ -28,9 +28,11 @@ from sds.runs import RunStats, enforce_quality_gate, quarantine, run_job
 from sds.timeutil import utc_now
 
 DATE_FORMAT = "%d-%b-%Y"
-# Electronic Form 4 filing starts in 2003. An earlier date is a bad value, such as
-# "02-JAN-24", which parses as the year 0024 and would make known_at precede every as_of.
-MIN_DATE = date(2003, 1, 1)
+# Lower date bounds. A 2-digit year such as "02-JAN-24" parses as the year 0024.
+# filing_date drives known_at, so it must not precede electronic Form 4 filing (2003).
+# Other dates describe facts a late filing can report from earlier years.
+MIN_FILING_DATE = date(2003, 1, 1)
+MIN_FACT_DATE = date(1990, 1, 1)
 MAX_DATE_AHEAD = timedelta(days=366)  # load_quarter's upper bound: one year past today
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
 CIK_PATTERN = r"^[0-9]{1,10}$"
@@ -199,10 +201,10 @@ def _split_rejects(
     return tagged.filter(pl.col("_reason") == "").drop("_reason"), rejected
 
 
-def _date(col: str, max_date: date) -> pl.Expr:
-    """The parsed date, or null when unparseable or outside [MIN_DATE, max_date]."""
+def _date(col: str, max_date: date, min_date: date = MIN_FACT_DATE) -> pl.Expr:
+    """The parsed date, or null when unparseable or outside [min_date, max_date]."""
     parsed = pl.col(col).str.strptime(pl.Date, DATE_FORMAT, strict=False)
-    return pl.when(parsed.is_between(MIN_DATE, max_date)).then(parsed)
+    return pl.when(parsed.is_between(min_date, max_date)).then(parsed)
 
 
 def _number(col: str) -> pl.Expr:
@@ -225,7 +227,7 @@ def _cast_failed(raw: str, typed: pl.Expr) -> pl.Expr:
 def _filings(subs: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rejected]]:
     flag = pl.col("is_10b5_1").str.to_lowercase()
     typed = subs.with_columns(
-        _date("filing_date", max_date).alias("_filing_date"),
+        _date("filing_date", max_date, MIN_FILING_DATE).alias("_filing_date"),
         _date("period_of_report", max_date).alias("_period"),
         _date("date_of_orig_sub", max_date).alias("_orig"),
         pl.when(flag.is_in(TRUE_VALUES))
@@ -327,7 +329,8 @@ def parse_zip(
 ) -> InsiderFrames:
     """Parse one quarterly zip into typed frames. Pure: no database, no network, no clock.
 
-    A date outside [MIN_DATE, max_date] is rejected like an unparseable one.
+    A date outside its bounds (MIN_FILING_DATE or MIN_FACT_DATE, to max_date) is
+    rejected like an unparseable one.
 
     Rows of out-of-scope forms or codes are skipped and not counted, except ragged rows:
     their fields are shifted, so they are rejected and counted whatever their form or
