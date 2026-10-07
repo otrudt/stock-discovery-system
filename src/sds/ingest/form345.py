@@ -33,6 +33,7 @@ DATE_FORMAT = "%d-%b-%Y"
 MIN_DATE = date(2003, 1, 1)
 MAX_DATE_AHEAD = timedelta(days=366)  # load_quarter's upper bound: one year past today
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
+CIK_PATTERN = r"^[0-9]{1,10}$"
 TRUE_VALUES = ["1", "true"]
 FALSE_VALUES = ["0", "false"]
 
@@ -167,6 +168,11 @@ def _number(col: str) -> pl.Expr:
     return pl.when(value.is_finite()).then(value)
 
 
+def _bad_cik(col: str) -> pl.Expr:
+    """True where a CIK is present but not 1 to 10 digits; a missing CIK is null."""
+    return pl.col(col).str.contains(CIK_PATTERN).not_()
+
+
 def _cast_failed(raw: str, typed: pl.Expr) -> pl.Expr:
     """True where the text was present but did not convert."""
     return pl.col(raw).is_not_null() & typed.is_null()
@@ -194,6 +200,7 @@ def _filings(subs: pl.DataFrame, max_date: date) -> tuple[pl.DataFrame, list[Rej
             "bad date_of_orig_sub": _cast_failed("date_of_orig_sub", pl.col("_orig")),
             "bad is_10b5_1": _cast_failed("is_10b5_1", pl.col("_10b5")),
             "no issuer_cik": pl.col("issuer_cik").is_null(),
+            "bad issuer_cik": _bad_cik("issuer_cik"),
         },
     )
     known_at = (
@@ -222,6 +229,7 @@ def _owners(owners: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
         {
             "duplicate key": pl.struct("accession_no", "owner_cik").is_duplicated(),
             "no owner_cik": pl.col("owner_cik").is_null(),
+            "bad owner_cik": _bad_cik("owner_cik"),
         },
     )
     roles = pl.col("relationship").fill_null("").str.split(",")

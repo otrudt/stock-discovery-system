@@ -188,6 +188,28 @@ def test_non_finite_numbers_are_rejected(column: str, value: str) -> None:
     assert frames.txns.is_empty()
 
 
+@pytest.mark.parametrize("cik", ["ab c", "12-34", "12345678901"])
+def test_non_digit_issuer_cik_is_rejected(cik: str) -> None:
+    frames = parse(build_zip([submission("a1", issuer=cik)], [owner("a1", "11")]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [
+        ("filings", "bad issuer_cik"),
+        ("owners", "filing rejected"),
+    ]
+
+
+@pytest.mark.parametrize("cik", ["ab c", "12-34", "12345678901"])
+def test_non_digit_owner_cik_is_rejected(cik: str) -> None:
+    frames = parse(build_zip([submission("a1")], [owner("a1", cik), owner("a1", "0012")]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [("owners", "bad owner_cik")]
+    assert frames.owners["owner_cik"].to_list() == ["0000000012"]
+
+
+def test_missing_ciks_keep_their_reasons() -> None:
+    raw = build_zip([submission("a1"), submission("a2", issuer="")], [owner("a1", "")])
+    reasons = sorted((r.table, r.reason) for r in parse(raw).rejected)
+    assert reasons == [("filings", "no issuer_cik"), ("owners", "no owner_cik")]
+
+
 def test_duplicate_keys_are_rejected_not_dropped() -> None:
     raw = build_zip(
         [submission("a1")],
