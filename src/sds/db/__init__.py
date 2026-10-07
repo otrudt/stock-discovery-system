@@ -57,7 +57,7 @@ def migrate(conn: duckdb.DuckDBPyConnection) -> list[int]:
 def insert_frame(
     conn: duckdb.DuckDBPyConnection, table: str, frame: pl.DataFrame, on_conflict: str = ""
 ) -> int:
-    """Insert a whole frame in one statement; returns the row count.
+    """Insert a whole frame in one statement; returns rows inserted or updated.
 
     Row-at-a-time `executemany` runs at about 1k rows/s in DuckDB; a scan of the frame
     is orders of magnitude faster. Columns are matched by name. `on_conflict` is a
@@ -68,7 +68,9 @@ def insert_frame(
     cols = ", ".join(frame.columns)
     conn.register("_insert_frame", frame)
     try:
-        conn.execute(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM _insert_frame {on_conflict}")
+        row = conn.execute(
+            f"INSERT INTO {table} ({cols}) SELECT {cols} FROM _insert_frame {on_conflict}"
+        ).fetchone()
     finally:
         conn.unregister("_insert_frame")
-    return frame.height
+    return 0 if row is None else int(row[0])

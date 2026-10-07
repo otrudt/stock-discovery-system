@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import duckdb
+import polars as pl
 
-from sds.db import migrate
+from sds.db import insert_frame, migrate
 
 
 def test_migrations_are_idempotent(conn: duckdb.DuckDBPyConnection) -> None:
@@ -27,3 +28,10 @@ def test_insider_tables_hold_a_joint_filing(conn: duckdb.DuckDBPyConnection) -> 
     )
     assert conn.execute("SELECT count(*) FROM insider_owners").fetchone() == (2,)
     assert conn.execute("SELECT sum(shares) FROM insider_txns").fetchone() == (100.0,)
+
+
+def test_insert_frame_returns_rows_actually_written(conn: duckdb.DuckDBPyConnection) -> None:
+    conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)")
+    frame = pl.DataFrame({"k": [1, 2], "v": [1, 1]})
+    assert insert_frame(conn, "t", frame, "ON CONFLICT DO NOTHING") == 2
+    assert insert_frame(conn, "t", frame, "ON CONFLICT DO NOTHING") == 0

@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, date, datetime
 
+import duckdb
 import pytest
 from form345_fixture import build_zip, line, owner, submission
 
-from sds.ingest.form345 import InsiderFrames, SchemaDriftError, parse_zip
+from sds.ingest.config import Form345Config
+from sds.ingest.form345 import (
+    InsiderFrames,
+    SchemaDriftError,
+    load_quarter,
+    parse_zip,
+    write_frames,
+)
+from sds.runs import QualityGateError
 
 FORMS = ["4", "4/A"]
 CODES = ["P", "S"]
@@ -137,3 +147,76 @@ def test_duplicate_keys_are_rejected_not_dropped() -> None:
     ]
     assert frames.owners.is_empty()
     assert frames.txns.is_empty()
+
+
+GOOD = build_zip([submission("a1")], [owner("a1", "11")], [line("a1", "1")])
+
+
+@pytest.fixture
+def cfg() -> Form345Config:
+    return Form345Config(start_quarter="2012q1", forms=FORMS, txn_codes=CODES)
+
+
+def test_load_quarter_writes_and_reload_writes_nothing(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    first = load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
+    second = load_quarter(conn, "2024q1", cfg, lambda: (GOOD, "h1"))
+
+    assert (first.rows_written, second.rows_written) == (3, 0)
+    assert conn.execute("SELECT raw_hash FROM insider_filings").fetchall() == [("h1",)]
+    assert conn.execute("SELECT job, status FROM runs").fetchall() == [
+        ("form345.2024q1", "ok"),
+        ("form345.2024q1", "ok"),
+    ]
+
+
+def test_gate_blocks_every_write_for_the_quarter(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    raw = build_zip(
+        [submission("a1"), submission("bad", filed="nope")],
+        [owner("a1", "11")],
+        [line("a1", "1")],
+    )
+    with pytest.raises(QualityGateError):
+        load_quarter(conn, "2024q1", cfg, lambda: (raw, "h1"))
+
+    for table in ("insider_filings", "insider_owners", "insider_txns"):
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+    assert conn.execute("SELECT reason, raw_hash FROM quarantine").fetchall() == [
+        ("filings: bad filing_date", "h1")
+    ]
+    assert conn.execute("SELECT status FROM runs").fetchall() == [("failed",)]
+
+
+def test_schema_drift_fails_the_run_by_name(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    raw = build_zip([submission("a1")], drop=frozenset({"FILING_DATE"}))
+    with pytest.raises(SchemaDriftError, match="FILING_DATE"):
+        load_quarter(conn, "2024q1", cfg, lambda: (raw, "h1"))
+    status, error = conn.execute("SELECT status, error FROM runs").fetchone() or ("", "")
+    assert status == "failed"
+    assert "FILING_DATE" in error
+
+
+def test_fetch_failure_is_recorded_as_a_failed_run(
+    conn: duckdb.DuckDBPyConnection, cfg: Form345Config
+) -> None:
+    def broken() -> tuple[bytes, str]:
+        raise OSError("connection reset")
+
+    with pytest.raises(OSError):
+        load_quarter(conn, "2024q1", cfg, broken)
+    assert conn.execute("SELECT status FROM runs").fetchall() == [("failed",)]
+
+
+def test_failed_write_rolls_back_earlier_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    frames = parse(GOOD)
+    broken = dataclasses.replace(frames, txns=frames.txns.drop("shares"))  # NOT NULL column gone
+    with pytest.raises(duckdb.Error):
+        write_frames(conn, broken, "h1")
+
+    assert conn.execute("SELECT count(*) FROM insider_filings").fetchone() == (0,)
+    assert write_frames(conn, frames, "h1") == 3  # the connection is usable again

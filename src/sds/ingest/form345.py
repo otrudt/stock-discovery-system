@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import io
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 
+import duckdb
 import polars as pl
+
+from sds.db import insert_frame
+from sds.ingest.config import Form345Config
+from sds.runs import RunStats, enforce_quality_gate, quarantine, run_job
 
 DATE_FORMAT = "%d-%b-%Y"
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
@@ -281,3 +287,51 @@ def parse_zip(raw: bytes, *, forms: list[str], txn_codes: list[str]) -> InsiderF
     owner_rows, bad_owners = _owners(children["owners"])
     txn_rows, bad_txns = _txns(children["txns"])
     return InsiderFrames(filings, owner_rows, txn_rows, rejected + bad_owners + bad_txns, rows_in)
+
+
+SOURCE = "sec/form345"
+_KEEP_EXISTING = "ON CONFLICT DO NOTHING"  # a filed fact does not change
+
+
+def write_frames(conn: duckdb.DuckDBPyConnection, frames: InsiderFrames, raw_hash: str) -> int:
+    """Write one quarter in one transaction; returns rows inserted."""
+    conn.execute("BEGIN")
+    try:
+        filings = frames.filings.with_columns(pl.lit(raw_hash).alias("raw_hash"))
+        written = insert_frame(conn, "insider_filings", filings, _KEEP_EXISTING)
+        written += insert_frame(conn, "insider_owners", frames.owners, _KEEP_EXISTING)
+        written += insert_frame(conn, "insider_txns", frames.txns, _KEEP_EXISTING)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return written
+
+
+def load_quarter(
+    conn: duckdb.DuckDBPyConnection,
+    quarter: str,
+    cfg: Form345Config,
+    raw: Callable[[], tuple[bytes, str]],
+) -> RunStats:
+    """Fetch (or read stored), parse, gate and write one quarter as one run.
+
+    `raw` returns (zip bytes, raw-store hash). It runs inside the run, so a fetch
+    failure is a failed run that `health` shows, like a gate failure.
+    """
+    with run_job(conn, f"form345.{quarter}") as stats:
+        data, raw_hash = raw()
+        frames = parse_zip(data, forms=cfg.forms, txn_codes=cfg.txn_codes)
+        stats.rows_in = frames.rows_in
+        for r in frames.rejected:
+            quarantine(
+                conn,
+                stats,
+                source=SOURCE,
+                reason=f"{r.table}: {r.reason}",
+                payload=r.payload,
+                raw_hash=raw_hash,
+            )
+        enforce_quality_gate(stats)
+        stats.rows_written = write_frames(conn, frames, raw_hash)
+    return stats
