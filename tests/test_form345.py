@@ -103,6 +103,32 @@ def test_roles_split_and_empty_relationship_has_no_roles() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("relationship", "flags"),
+    [
+        ("DirectorOther", (True, False, False, True)),  # pre-2023 files omit the comma
+        ("Director,OfficerOther", (True, True, False, True)),
+        ("TenPercentOwnerOther", (False, False, True, True)),
+        ("Director, Officer", (True, True, False, False)),
+        ("", (False, False, False, False)),
+    ],
+)
+def test_known_role_sequences_are_accepted(
+    relationship: str, flags: tuple[bool, bool, bool, bool]
+) -> None:
+    frames = parse(build_zip([submission("a1")], [owner("a1", "11", relationship=relationship)]))
+    assert frames.rejected == []
+    roles = frames.owners.select("is_director", "is_officer", "is_ten_pct_owner", "is_other")
+    assert roles.rows() == [flags]
+
+
+@pytest.mark.parametrize("relationship", ["10% Owner", "director", "Director,Trustee"])
+def test_unknown_role_tokens_are_rejected(relationship: str) -> None:
+    frames = parse(build_zip([submission("a1")], [owner("a1", "11", relationship=relationship)]))
+    assert [(r.table, r.reason) for r in frames.rejected] == [("owners", "bad relationship")]
+    assert frames.owners.is_empty()
+
+
 def test_out_of_scope_forms_and_codes_are_skipped_not_rejected() -> None:
     raw = build_zip(
         [submission("f4"), submission("f5", form="5")],

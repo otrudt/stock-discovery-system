@@ -34,6 +34,16 @@ MIN_DATE = date(2003, 1, 1)
 MAX_DATE_AHEAD = timedelta(days=366)  # load_quarter's upper bound: one year past today
 KNOWN_AT_HOUR = 22  # EDGAR filing cut-off, New York time
 CIK_PATTERN = r"^[0-9]{1,10}$"
+# RPTOWNER_RELATIONSHIP token -> our flag. Pre-2023 files join "Other" with no comma
+# ("DirectorOther"), so a valid value is any sequence of these tokens, with optional
+# commas and whitespace between them. No token is a substring of another.
+ROLE_FLAGS = {
+    "Director": "is_director",
+    "Officer": "is_officer",
+    "TenPercentOwner": "is_ten_pct_owner",
+    "Other": "is_other",
+}
+ROLE_PATTERN = rf"^\s*(?:(?:{'|'.join(ROLE_FLAGS)})\s*,?\s*)*$"
 TRUE_VALUES = ["1", "true"]
 FALSE_VALUES = ["0", "false"]
 
@@ -266,17 +276,15 @@ def _owners(owners: pl.DataFrame) -> tuple[pl.DataFrame, list[Rejected]]:
             "duplicate key": pl.struct("accession_no", "owner_cik").is_duplicated(),
             "no owner_cik": pl.col("owner_cik").is_null(),
             "bad owner_cik": _bad_cik("owner_cik"),
+            "bad relationship": pl.col("relationship").str.contains(ROLE_PATTERN).not_(),
         },
     )
-    roles = pl.col("relationship").fill_null("").str.split(",")
+    roles = pl.col("relationship").fill_null("")
     return good.select(
         "accession_no",
         pl.col("owner_cik").str.zfill(10),
         "owner_name",
-        roles.list.contains("Director").alias("is_director"),
-        roles.list.contains("Officer").alias("is_officer"),
-        roles.list.contains("TenPercentOwner").alias("is_ten_pct_owner"),
-        roles.list.contains("Other").alias("is_other"),
+        *(roles.str.contains(token, literal=True).alias(f) for token, f in ROLE_FLAGS.items()),
         "officer_title",
     ), rejected
 
