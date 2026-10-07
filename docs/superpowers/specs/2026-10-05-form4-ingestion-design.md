@@ -31,8 +31,11 @@ keeps every zip whole, so each of these is a re-parse, not a refetch.
   newest under `/files/datastandardsinnovation/`. URLs are read from the page, never
   built from a pattern.
 - `SUBMISSION.FILING_DATE` is a date (DD-MON-YYYY). No acceptance time exists.
-- `SUBMISSION.AFF10B5ONE` exists (the PDF readme omits it). Values seen: `true`,
-  `false`, `1`, `0`, NULL. The flag is per filing.
+- `SUBMISSION.AFF10B5ONE` exists in 2026q2 (the PDF readme omits it). Values seen:
+  `true`, `false`, `1`, `0`, NULL. The flag is per filing. The column is absent from
+  2012q1 and 2019q1 (checked 2026-10-06), so it is optional: a file without it
+  gives NULL.
+- 2012q1, 2019q1 and 2026q2 all decode as strict UTF-8.
 - One filing can have several reporting owners: 585 of 5,326 P lines (11%) sit in
   filings with 2+ owners.
 - `RPTOWNER_RELATIONSHIP` is a comma list of `Director`, `Officer`,
@@ -51,7 +54,7 @@ keeps every zip whole, so each of these is a re-parse, not a refetch.
 | Parse engine | polars, all-text read, vectorized casts | No per-row Python; failed casts become quarantine rows |
 | `known_at` | `filing_date` at 22:00 America/New_York | EDGAR cut-off; late by up to a day, never early |
 | Unit of work | One `run_job`, gate and transaction per quarter | A bad quarter fails alone |
-| Conflict policy | `ON CONFLICT DO NOTHING` | A filed fact does not change; corrections need `--refetch` |
+| Conflict policy | `ON CONFLICT DO NOTHING` | A filed fact does not change. `--refetch` adds filings new to a republished quarter; it never overwrites a stored row. Detecting changed rows is deferred |
 | Amendment with no match or several matches | Excluded from events; originals kept; counted | Decided before data; no double counting |
 | Transaction codes | P and S (config) | S is needed for the routine/opportunistic classification |
 
@@ -129,8 +132,11 @@ its contract.
 1. **Discover.** Fetch the data-set page once; read the `*_form345.zip` links; keep
    quarters from `start_quarter`. No links found: stop with an error.
 2. **Fetch.** Each zip goes to the raw store (`source = sec/form345`) through
-   `PoliteClient` with `SDS_USER_AGENT`, under 10 requests per second. A quarter whose
-   URI is already in `raw_documents` is skipped unless `--refetch`.
+   `PoliteClient` with `SDS_USER_AGENT`, under 10 requests per second. Without
+   `--refetch`: a quarter with an `ok` run (`job = form345.<quarter>`) is skipped; a
+   quarter whose zip is in the raw store but has no `ok` run is re-parsed from the
+   store with no fetch (a failed gate must not strand a quarter). With `--refetch`,
+   the zip is fetched again.
 3. **Parse** (`parse_zip(raw: bytes) -> InsiderFrames`, no network). Read
    `SUBMISSION`, `REPORTINGOWNER` and `NONDERIV_TRANS` as text (tab separated, no
    quote character). Keep forms and codes from config. Lines and owners of a filtered
@@ -141,7 +147,9 @@ its contract.
    Split the relationship list into four flags. A failed cast quarantines the row with
    the column and the value. A line or owner whose accession is missing from
    `SUBMISSION` is quarantined. A required column missing from a header fails the
-   quarter with the column name; extra columns are ignored.
+   quarter with the column name; an optional column (only `AFF10B5ONE`) missing
+   gives NULL; extra columns are ignored. Files are decoded as strict UTF-8, so a
+   bad byte fails the quarter rather than altering text.
 5. **Gate and write.** One `run_job` per quarter (`job = form345.<quarter>`). Enforce
    the 1% gate on that quarter's rows, then write the three frames in one transaction
    with `insert_frame(..., "ON CONFLICT DO NOTHING")`.
@@ -182,7 +190,7 @@ study"; this file is "what to load".
 
 | Case | Behavior |
 |---|---|
-| Network failure for a quarter | That run fails; other quarters continue; non-zero exit |
+| Network failure for a quarter | That quarter's run (the fetch is inside it) fails; other quarters continue; non-zero exit |
 | Gate exceeded | That quarter writes nothing; run fails |
 | Required column missing | That quarter fails with the column name |
 | No zip links on the page | The command stops |
