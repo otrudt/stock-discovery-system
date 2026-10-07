@@ -67,23 +67,62 @@ def prices_as_of(
     return conn.execute(sql, params).pl()
 
 
+# Which filings are public at $as_of. Both insider reads use this one rule:
+# - a filing appears once filed;
+# - an amendment appears only if the link pass tied it to exactly one original
+#   (decided 2026-10-05, before any data: no double counting);
+# - a filing disappears once the next amendment in its chain is itself public.
+_VISIBLE_INSIDER_FILINGS = """
+    SELECT f.*
+    FROM insider_filings f
+    LEFT JOIN insider_filings nxt
+      ON nxt.accession_no = f.superseded_by AND nxt.known_at <= $as_of
+    WHERE f.known_at <= $as_of
+      AND (f.form <> '4/A' OR f.amendment_match = 'one')
+      AND nxt.accession_no IS NULL
+      AND ($ciks IS NULL OR list_contains($ciks, f.issuer_cik))
+"""
+
+
 def insider_txns_as_of(
     conn: duckdb.DuckDBPyConnection,
     as_of: datetime,
     issuer_ciks: list[str] | None = None,
 ) -> pl.DataFrame:
-    """Form 4 lines public at `as_of`, with an amendment replacing its original only
-    once the amendment itself was public."""
+    """Form 4 lines public at `as_of`, one row per line, with its filing's fields.
+
+    An amendment replaces its original only once the amendment itself was public.
+    """
     as_of = require_aware(as_of)
-    sql = """
-        SELECT t.*
-        FROM insider_txns t
-        LEFT JOIN insider_txns amend
-          ON amend.accession_no = t.superseded_by AND amend.known_at <= $as_of
-        WHERE t.known_at <= $as_of
-          AND amend.accession_no IS NULL
-          AND ($ciks IS NULL OR list_contains($ciks, t.issuer_cik))
-        ORDER BY t.issuer_cik, t.event_date
+    sql = f"""
+        WITH visible AS ({_VISIBLE_INSIDER_FILINGS})
+        SELECT t.accession_no, t.line_id, f.issuer_cik, f.form, f.filing_date,
+               f.is_10b5_1, f.known_at, t.txn_code, t.txn_date, t.shares, t.price,
+               t.acquired_disposed, t.shares_owned_after, t.direct_indirect
+        FROM insider_txns t JOIN visible f USING (accession_no)
+        ORDER BY f.issuer_cik, t.txn_date, t.accession_no, t.line_id
+    """
+    return conn.execute(sql, {"as_of": as_of, "ciks": issuer_ciks}).pl()
+
+
+def insider_owners_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    as_of: datetime,
+    issuer_ciks: list[str] | None = None,
+) -> pl.DataFrame:
+    """Reporting owners of the filings public at `as_of`, one row per (filing, owner).
+
+    Roles are as reported in each filing. Join to `insider_txns_as_of` on accession_no
+    only after aggregating lines per filing, or a joint filing's shares count once per
+    owner.
+    """
+    as_of = require_aware(as_of)
+    sql = f"""
+        WITH visible AS ({_VISIBLE_INSIDER_FILINGS})
+        SELECT o.accession_no, f.issuer_cik, f.known_at, o.owner_cik, o.owner_name,
+               o.is_director, o.is_officer, o.is_ten_pct_owner, o.is_other, o.officer_title
+        FROM insider_owners o JOIN visible f USING (accession_no)
+        ORDER BY f.issuer_cik, o.accession_no, o.owner_cik
     """
     return conn.execute(sql, {"as_of": as_of, "ciks": issuer_ciks}).pl()
 

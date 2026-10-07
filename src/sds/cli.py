@@ -101,7 +101,7 @@ def health() -> None:
         """
         SELECT 'prices/' || source, max(known_at) FROM prices_daily GROUP BY source
         UNION ALL SELECT 'fundamentals', max(known_at) FROM fundamentals
-        UNION ALL SELECT 'insider_txns', max(known_at) FROM insider_txns
+        UNION ALL SELECT 'insider_filings', max(known_at) FROM insider_filings
         UNION ALL SELECT 'congress_txns', max(known_at) FROM congress_txns
         """
     ).fetchall()

@@ -73,25 +73,87 @@ def test_bar_known_only_after_close(conn: duckdb.DuckDBPyConnection) -> None:
     assert asof.prices_as_of(conn, close).height == 1
 
 
-def test_amendment_supersedes_only_once_public(conn: duckdb.DuckDBPyConnection) -> None:
-    def add_txn(acc: str, shares: float, known: str, superseded_by: str | None = None) -> None:
+def add_filing(
+    conn: duckdb.DuckDBPyConnection,
+    acc: str,
+    known: str,
+    *,
+    form: str = "4",
+    superseded_by: str | None = None,
+    match: str | None = None,
+    owners: tuple[str, ...] = ("0000000001",),
+) -> None:
+    conn.execute(
+        "INSERT INTO insider_filings (accession_no, issuer_cik, form, filing_date,"
+        " period_of_report, known_at, superseded_by, amendment_match, raw_hash)"
+        " VALUES (?, ?, ?, ?, '2024-03-01', ?, ?, ?, 'h')",
+        [acc, CIK, form, ts(known).date(), ts(known), superseded_by, match],
+    )
+    for owner in owners:
         conn.execute(
-            "INSERT INTO insider_txns (accession_no, line_no, issuer_cik, insider_cik,"
-            " is_director, is_officer, is_ten_pct_owner, officer_title, txn_code, shares,"
-            " price, event_date, known_at, superseded_by) VALUES"
-            " (?, 1, ?, '0000000001', false, true, false, 'CFO', 'P', ?, 10.0,"
-            " '2024-03-01', ?, ?)",
-            [acc, CIK, shares, ts(known), superseded_by],
+            "INSERT INTO insider_owners VALUES (?, ?, NULL, false, true, false, false, 'CFO')",
+            [acc, owner],
         )
 
-    add_txn("orig", 1000, "2024-03-04 21:00", superseded_by="amend")
-    add_txn("amend", 10000, "2024-03-20 21:00")
+
+def add_line(conn: duckdb.DuckDBPyConnection, acc: str, shares: float) -> None:
+    conn.execute(
+        "INSERT INTO insider_txns (accession_no, line_id, txn_code, txn_date, shares, price)"
+        " VALUES (?, '1', 'P', '2024-03-01', ?, 10.0)",
+        [acc, shares],
+    )
+
+
+def test_amendment_supersedes_only_once_public(conn: duckdb.DuckDBPyConnection) -> None:
+    add_filing(conn, "orig", "2024-03-04 21:00", superseded_by="amend")
+    add_filing(conn, "amend", "2024-03-20 21:00", form="4/A", match="one")
+    add_line(conn, "orig", 1000)
+    add_line(conn, "amend", 10000)
 
     mid = asof.insider_txns_as_of(conn, ts("2024-03-10 00:00"))
     late = asof.insider_txns_as_of(conn, ts("2024-04-01 00:00"))
 
     assert mid["shares"].to_list() == [1000]
     assert late["shares"].to_list() == [10000]
+
+
+def test_amendment_chain_shows_only_the_latest_public_version(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    add_filing(conn, "o", "2024-03-04 21:00", superseded_by="a1")
+    add_filing(conn, "a1", "2024-03-10 21:00", form="4/A", match="one", superseded_by="a2")
+    add_filing(conn, "a2", "2024-03-20 21:00", form="4/A", match="one")
+    for acc, shares in (("o", 1), ("a1", 2), ("a2", 3)):
+        add_line(conn, acc, shares)
+
+    seen = [
+        asof.insider_txns_as_of(conn, ts(t))["shares"].to_list()
+        for t in ("2024-03-05 00:00", "2024-03-11 00:00", "2024-03-21 00:00")
+    ]
+    assert seen == [[1.0], [2.0], [3.0]]
+
+
+def test_unlinked_amendments_are_excluded_and_original_kept(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    add_filing(conn, "orig", "2024-03-04 21:00")
+    add_filing(conn, "none", "2024-03-20 21:00", form="4/A", match="none")
+    add_filing(conn, "many", "2024-03-20 21:00", form="4/A", match="many")
+    add_filing(conn, "unlinked", "2024-03-20 21:00", form="4/A")  # link pass not run yet
+    for acc in ("orig", "none", "many", "unlinked"):
+        add_line(conn, acc, 5)
+
+    visible = asof.insider_txns_as_of(conn, ts("2024-04-01 00:00"))
+    assert visible["accession_no"].to_list() == ["orig"]
+
+
+def test_joint_filing_shares_counted_once(conn: duckdb.DuckDBPyConnection) -> None:
+    add_filing(conn, "joint", "2024-03-04 21:00", owners=("0000000011", "0000000012", "0000000013"))
+    add_line(conn, "joint", 100)
+    as_of = ts("2024-04-01 00:00")
+
+    assert asof.insider_txns_as_of(conn, as_of)["shares"].sum() == 100
+    assert asof.insider_owners_as_of(conn, as_of).height == 3
 
 
 def test_curated_universe_excluded_from_strict_backtest(conn: duckdb.DuckDBPyConnection) -> None:
