@@ -41,6 +41,7 @@ uv sync --all-groups
 uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
 
 uv run sds init | universe check | universe seed | prices load [--only-missing] | health
+uv run sds insiders load [--since 2012q1] [--quarter 2026q2] [--refetch] | insiders link
 ```
 
 The code reads `os.environ` only. Source `.env` first: `set -a; . ./.env; set +a`.
@@ -97,10 +98,24 @@ Run all four checks before every commit. CI runs the same ones.
 - **Tiingo free tier allows ~50 requests per hour.** A full load of more than 50
   tickers fails the rest with 429. Fill the gap an hour later with
   `prices load --only-missing`.
+- **Form 4 loaded on 2026-10-07** (Phase 1 steps 1–2). SEC quarterly flat files
+  2012q1–2026q3, 59 quarters in 70 s: 2,774,022 filings, 2,995,700 owner rows,
+  1,770,582 lines (468,786 P, 1,301,796 S). 281 rows quarantined in total; no quarter
+  near the 1% gate. 2026q2 matched independent DuckDB counts exactly. 4/A links:
+  one=51,771, none=4,933, many=529. No accession appears in more than one zip.
+- **Form 4 rules that bind research code:**
+  - Do not backtest on insider data until a full load and a link pass are complete.
+    A past view can still change through ingestion completeness (an original loaded
+    after its amendment), though never through knowledge leakage.
+  - Rows are `ON CONFLICT DO NOTHING`: a parser fix does not correct stored rows.
+    There is no `--reparse` yet; a fix needs a manual purge by `raw_hash`, then a load.
+  - Do not use `insiders load --refetch` casually; a stored filing never takes new
+    owners or lines from a later load.
+  - Two amendments of one original on the same day share `known_at` (date-only
+    files); the chain orders them by accession number, which is arbitrary.
 - **Next, Phase 1:**
-  1. Form 4 ingestion. Backfill from the SEC Insider Transactions Data Sets
-     (quarterly flat files); use per-filing XML for recent filings.
-  2. Mark amendments (4/A) through `superseded_by`.
+  1. Per-filing XML for filings after the last quarterly file.
+  2. (done) Amendments marked through `superseded_by`.
   3. Mark routine vs. opportunistic insiders.
   4. Run the first event study: excess return vs. the universe at 21, 63, 126 and 252
      trading days.

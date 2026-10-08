@@ -30,6 +30,7 @@ uv run sds init             # create data/sds.duckdb
 uv run sds universe check   # validate the sector config
 uv run sds universe seed    # resolve tickers to SEC CIKs
 uv run sds prices load --start 2015-01-01
+uv run sds insiders load      # SEC Form 4 flat files, 2012q1 onward, then link 4/As
 uv run sds health           # freshness per source, last run per job
 ```
 
