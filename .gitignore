@@ -1,0 +1,17 @@
+# Local data never goes in git: raw downloads, the database, run artifacts.
+data/
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Secrets
+.env
